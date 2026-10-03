@@ -1,0 +1,892 @@
+#!/usr/bin/env bash
+# fingerdrag - macOS-style three- and four-finger drag for Linux touchpads.
+#
+# libinput has implemented multi-finger drag since 1.28, but the feature is
+# off by default and has to be switched on by the compositor. Compositors
+# that do not expose the setting yet (KWin before Plasma 6.9, for one), and
+# every X11 desktop, leave users with no way to enable it. This tool rebuilds
+# the distribution's libinput package with the feature enabled by default,
+# keeps the stock packages for rollback, and warns when a system upgrade
+# replaces the build. On releases whose libinput is too old it can backport
+# the package from a newer release of the same distribution.
+#
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+VERSION=0.3.0
+SUFFIX=fingerdrag
+# String the patched library contains; used to recognise a patched build
+# regardless of the package version it carries.
+MARK=LIBINPUT_DRAG_3FG_DEFAULT
+# String that carries the finger count compiled into the patched library.
+BUILTIN_MARK=FINGERDRAG_BUILTIN_NFINGERS
+# The one source line the build rewrites to choose that finger count.
+BUILTIN_DEFINE='#define FINGERDRAG_DEFAULT_NFINGERS'
+# libinput API a compositor must call to offer the setting natively.
+NATIVE_SYMBOL=libinput_device_config_3fg_drag_set_enabled
+MIN_LIBINPUT=1.28
+PKG=libinput10
+# Finger count used when none is given and none is remembered. Three is the
+# gesture people know by name; four keeps the three-finger tap.
+DEFAULT_FINGERS=3
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+SELF_DIR=$(dirname "$SELF")
+PREFIX=${FINGERDRAG_PREFIX:-/usr/local}
+STATE_DIR=/var/lib/fingerdrag
+STATE_FILE=$STATE_DIR/enabled
+HOOK_FILE=/etc/apt/apt.conf.d/99fingerdrag
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/fingerdrag
+ENV_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/fingerdrag.conf
+
+if [[ -n ${FINGERDRAG_DATADIR:-} ]]; then
+	PATCH_DIR=$FINGERDRAG_DATADIR
+elif [[ -d $SELF_DIR/patches ]]; then
+	PATCH_DIR=$SELF_DIR/patches
+else
+	PATCH_DIR=$PREFIX/share/fingerdrag/patches
+fi
+
+# --- output -----------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+	B=$'\e[1m' G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' N=$'\e[0m'
+else
+	B='' G='' Y='' R='' N=''
+fi
+
+info() { printf '%s\n' "$*"; }
+step() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*" >&2; }
+die() {
+	printf '%serror:%s %s\n' "$R" "$N" "$*" >&2
+	exit 1
+}
+row() { printf '  %-22s %s\n' "$1" "$2"; }
+
+as_root() {
+	if [[ $EUID -eq 0 ]]; then
+		"$@"
+	else
+		sudo "$@"
+	fi
+}
+
+# --- system facts -----------------------------------------------------------
+
+# Print one field of /etc/os-release without leaking the rest into our scope.
+os_field() {
+	(
+		# shellcheck disable=SC1091
+		[[ -r /etc/os-release ]] && . /etc/os-release
+		eval "printf '%s' \"\${$1:-}\""
+	)
+}
+
+distro_family() {
+	case " $(os_field ID) $(os_field ID_LIKE) " in
+	*" debian "* | *" ubuntu "*) echo debian ;;
+	*" arch "*) echo arch ;;
+	*" fedora "* | *" rhel "*) echo fedora ;;
+	*" suse "* | *" opensuse "*) echo suse ;;
+	*) echo unknown ;;
+	esac
+}
+
+distro_name() {
+	local name
+	name=$(os_field PRETTY_NAME)
+	echo "${name:-unknown}"
+}
+
+# ubuntu, debian, or empty: which archive the system's base packages come
+# from. Linux Mint is ubuntu here; LMDE is debian.
+base_distro() {
+	local id like
+	id=$(os_field ID)
+	like=" $(os_field ID_LIKE) "
+	if [[ -n $(os_field DEBIAN_CODENAME) && -z $(os_field UBUNTU_CODENAME) ]]; then
+		echo debian
+	elif [[ $id == ubuntu || -n $(os_field UBUNTU_CODENAME) || $like == *" ubuntu "* ]]; then
+		echo ubuntu
+	elif [[ $id == debian || $like == *" debian "* ]]; then
+		echo debian
+	fi
+}
+
+# Where to take a newer libinput from when the system's own is too old.
+# Sets BP_LABEL, BP_URI, BP_SUITES and BP_KEYRING; fails if none is known.
+backport_source() {
+	case "$(base_distro)" in
+	ubuntu)
+		BP_LABEL="Ubuntu 26.04"
+		BP_URI=http://archive.ubuntu.com/ubuntu
+		BP_SUITES="resolute resolute-updates"
+		BP_KEYRING=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+		;;
+	debian)
+		BP_LABEL="Debian 13"
+		BP_URI=http://deb.debian.org/debian
+		BP_SUITES="trixie trixie-updates"
+		BP_KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg
+		;;
+	*) return 1 ;;
+	esac
+	BP_SUITES=${FINGERDRAG_BACKPORT_SUITES:-$BP_SUITES}
+}
+
+pkg_installed() {
+	dpkg-query -W -f='${db:Status-Status}\n' "$1" 2>/dev/null | grep -c '^installed$' >/dev/null
+}
+
+# Installed binary package version, empty if not installed.
+installed_version() {
+	dpkg-query -W -f='${db:Status-Status} ${Version}\n' "$PKG" 2>/dev/null |
+		awk '$1 == "installed" { print $2; exit }'
+}
+
+# Number of architectures the library is installed for.
+installed_arch_count() {
+	dpkg-query -W -f='${db:Status-Status}\n' "$PKG" 2>/dev/null | grep -c '^installed$' || true
+}
+
+# 1.31.1-1ubuntu1~tux1+fingerdrag2 -> 1.31.1
+upstream_of() {
+	local v=${1#*:}
+	echo "${v%%-*}"
+}
+
+version_ge() { dpkg --compare-versions "$1" ge "$2"; }
+
+libinput_so() {
+	dpkg -L "$PKG" 2>/dev/null | grep -m1 -E '/libinput\.so\.[0-9]+$' || true
+}
+
+is_patched() {
+	local so
+	so=$(libinput_so)
+	[[ -n $so ]] && grep -a -q "$MARK" "$so"
+}
+
+# Finger count compiled into the installed library. Builds that predate the
+# marker always defaulted to four.
+builtin_fingers() {
+	local so n
+	so=$(libinput_so)
+	n=$(grep -a -o "$BUILTIN_MARK=[0-9]" "$so" 2>/dev/null | head -1 || true)
+	echo "${n:+${n#*=}}"
+}
+
+# Newest version of the library offered by the configured repositories.
+# Locally built packages never appear here, so this is always a stock version.
+repo_version() {
+	local best='' v
+	while read -r v; do
+		[[ -z $v ]] && continue
+		if [[ -z $best ]] || dpkg --compare-versions "$v" gt "$best"; then
+			best=$v
+		fi
+	done < <(apt-cache madison "$PKG" 2>/dev/null | awk -F'|' '{ gsub(/ /, "", $2); print $2 }')
+	echo "$best"
+}
+
+# Repository base URLs that offer the given version.
+repo_urls_for() {
+	apt-cache madison "$PKG" 2>/dev/null |
+		awk -F'|' -v want="$1" '{
+			v = $2; gsub(/ /, "", v)
+			if (v == want) { split($3, a, " "); sub(/\/$/, "", a[1]); print a[1] }
+		}' | sort -u
+}
+
+# Value of a key in the state file written by install, empty if absent.
+state_get() {
+	[[ -r $STATE_FILE ]] || return 0
+	sed -n "s/^$1=//p" "$STATE_FILE" | head -1
+}
+
+session_type() { echo "${XDG_SESSION_TYPE:-unknown}"; }
+
+compositor_name() {
+	local d=${XDG_CURRENT_DESKTOP:-}
+	if [[ $(session_type) == x11 ]]; then
+		echo xorg
+		return
+	fi
+	case "${d,,}" in
+	*kde*) echo kwin ;;
+	*gnome*) echo mutter ;;
+	*hyprland*) echo hyprland ;;
+	*sway*) echo sway ;;
+	*labwc*) echo labwc ;;
+	*niri*) echo niri ;;
+	*cosmic*) echo cosmic ;;
+	'') echo unknown ;;
+	*) echo "${d,,}" ;;
+	esac
+}
+
+# Shared library that holds the compositor's libinput backend, if we know it.
+compositor_lib() {
+	local pattern
+	case "$1" in
+	kwin) pattern='libkwin[.]so[.][0-9]+ ' ;;
+	mutter) pattern='libmutter-[0-9]+[.]so[.][0-9]+ ' ;;
+	*) return 0 ;;
+	esac
+	ldconfig -p 2>/dev/null | awk -v p="$pattern" '$0 ~ p { print $NF; exit }'
+}
+
+# yes / no / config / unknown
+native_support() {
+	local comp=$1 lib
+	case "$comp" in
+	hyprland | sway | labwc)
+		# These call the libinput API and expose it in their own config.
+		echo config
+		return
+		;;
+	xorg)
+		# The xf86-input-libinput driver has no drag option at all.
+		echo no
+		return
+		;;
+	esac
+	lib=$(compositor_lib "$comp")
+	if [[ -z $lib || ! -r $lib ]]; then
+		echo unknown
+	elif grep -a -q "$NATIVE_SYMBOL" "$lib"; then
+		echo yes
+	else
+		echo no
+	fi
+}
+
+fingers_word() {
+	case "$1" in
+	0) echo off ;;
+	3) echo "three fingers" ;;
+	*) echo "four fingers" ;;
+	esac
+}
+
+# The drag mode in effect: the environment override where the session reads
+# it, otherwise the count compiled into the library.
+configured_mode() {
+	local dir=${XDG_CONFIG_HOME:-$HOME/.config}/environment.d val='' builtin
+	builtin=$(builtin_fingers)
+	# On X11 the X server is started by the display manager and never sees
+	# the user's environment.d, so only the built-in count applies.
+	if [[ $(session_type) != x11 && -d $dir ]]; then
+		val=$(cat "$dir"/*.conf 2>/dev/null | sed -n "s/^$MARK=//p" | tail -1)
+	fi
+	case "$val" in
+	0 | 3 | 4) echo "$(fingers_word "$val") (set in environment.d)" ;;
+	*) echo "$(fingers_word "${builtin:-4}") (built in)" ;;
+	esac
+}
+
+# True if a running compositor still maps a libinput that has been replaced.
+compositor_needs_restart() {
+	local pid
+	for pid in $(pgrep -u "$(id -u)" -x 'kwin_wayland|gnome-shell' 2>/dev/null); do
+		grep -q 'libinput\.so.*(deleted)' "/proc/$pid/maps" 2>/dev/null && return 0
+	done
+	return 1
+}
+
+# --- patch selection --------------------------------------------------------
+
+# Highest series directory whose name is not newer than the given version.
+pick_series() {
+	local want=$1 best='' d name
+	[[ -d $PATCH_DIR ]] || die "patch directory not found: $PATCH_DIR"
+	for d in "$PATCH_DIR"/*/; do
+		name=$(basename "$d")
+		[[ $name =~ ^[0-9]+\.[0-9]+$ ]] || continue
+		if version_ge "$want" "$name"; then
+			if [[ -z $best ]] || version_ge "$name" "$best"; then
+				best=$name
+			fi
+		fi
+	done
+	echo "$best"
+}
+
+# --- doctor -----------------------------------------------------------------
+
+cmd_doctor() {
+	local family ver up='' stock='' comp native patched=no series='' too_old=no
+	family=$(distro_family)
+	comp=$(compositor_name)
+	native=$(native_support "$comp")
+
+	info "${B}fingerdrag $VERSION${N}"
+	row "Distribution" "$(distro_name) ($family family)"
+	row "Session" "$(session_type) / ${XDG_CURRENT_DESKTOP:-unknown}"
+
+	if [[ $family == debian ]]; then
+		ver=$(installed_version)
+		if [[ -z $ver ]]; then
+			row "libinput" "${R}not installed${N}"
+			return 1
+		fi
+		up=$(upstream_of "$ver")
+		stock=$(repo_version)
+		is_patched && patched=yes
+		series=$(pick_series "$up")
+		row "libinput" "$ver"
+		if version_ge "$up" "$MIN_LIBINPUT"; then
+			row "Feature in libinput" "yes (needs $MIN_LIBINPUT, have $up)"
+		else
+			too_old=yes
+			row "Feature in libinput" "${R}no${N} (needs $MIN_LIBINPUT, have $up)"
+			if backport_source; then
+				row "Backport" "can be built from $BP_LABEL sources"
+			else
+				row "Backport" "no source known for this distribution"
+			fi
+		fi
+		row "Patched build" "$([[ $patched == yes ]] && echo "${G}yes${N}" || echo no)"
+		row "Stock in repositories" "$stock"
+		row "Patch series" "${series:-none for this version}"
+	else
+		row "libinput" "$(libinput --version 2>/dev/null || echo unknown)"
+	fi
+
+	case "$comp:$native" in
+	xorg:*) row "Compositor" "X11, the X driver has no drag option" ;;
+	*:yes) row "Compositor" "$comp, ${G}exposes the setting natively${N}" ;;
+	*:config) row "Compositor" "$comp, ${G}has its own config option${N}" ;;
+	*:no) row "Compositor" "$comp, does not expose the setting" ;;
+	*) row "Compositor" "$comp, native support unknown" ;;
+	esac
+	[[ $patched == yes ]] && row "Drag mode" "$(configured_mode)"
+	if [[ -e $STATE_FILE ]]; then
+		row "Upgrade watch" "on"
+	else
+		row "Upgrade watch" "off"
+	fi
+
+	info ""
+	if [[ $native == yes || $native == config ]]; then
+		info "${G}Your compositor can enable multi-finger drag itself.${N} No patched"
+		info "libinput is needed. Look for the touchpad drag option in its settings."
+		[[ $patched == yes ]] && info "Return to stock packages with: fingerdrag uninstall"
+	elif [[ $family != debian ]]; then
+		info "${Y}Building is only implemented for Debian and Ubuntu based systems so far.${N}"
+		[[ $family == arch ]] && info "On Arch, the AUR has a libinput-three-finger-drag package."
+	elif [[ $patched == yes ]]; then
+		info "${G}Patched libinput is installed.${N}"
+		if compositor_needs_restart; then
+			info "${Y}The running compositor still uses the old library. Log out and back in.${N}"
+		fi
+		if [[ $(session_type) == x11 ]]; then
+			info "Change the finger count with: fingerdrag install --fingers 3|4"
+		else
+			info "Change the finger count with: fingerdrag set 3|4|off"
+		fi
+		[[ -e $STATE_FILE ]] ||
+			info "This build is not managed by fingerdrag yet. Run 'fingerdrag install' to adopt it."
+	elif [[ -e $STATE_FILE ]]; then
+		info "${Y}A system upgrade replaced the patched build.${N} Restore it with:"
+		info "  fingerdrag install"
+	elif [[ $too_old == yes ]]; then
+		info "${Y}This libinput is too old.${N} Multi-finger drag arrived in $MIN_LIBINPUT."
+		if backport_source; then
+			info "A newer libinput can be built from $BP_LABEL sources and installed in"
+			info "place of the system one. After that, libinput updates from your"
+			info "distribution no longer apply. To go ahead:"
+			info "  fingerdrag install --backport"
+			info "That sets up three-finger drag. Add --fingers 4 for four fingers."
+		fi
+	else
+		info "Ready to build. Run:"
+		info "  fingerdrag install"
+		info "That sets up three-finger drag. Add --fingers 4 for four fingers."
+	fi
+}
+
+# --- build ------------------------------------------------------------------
+
+require_debian() {
+	[[ $(distro_family) == debian ]] ||
+		die "building is only implemented for Debian and Ubuntu based systems so far"
+	local c
+	for c in dpkg-buildpackage dpkg-source patch apt-get apt-cache; do
+		command -v "$c" >/dev/null ||
+			die "missing '$c'. Install with: sudo apt-get install build-essential dpkg-dev patch"
+	done
+	[[ $(installed_arch_count) -le 1 ]] ||
+		die "$PKG is installed for more than one architecture; that is not supported yet"
+}
+
+# deb822 stanzas from one .sources file that serve the given URL, rewritten
+# as deb-src. Signed-By settings are kept, so signatures are verified exactly
+# as they are for binary packages.
+src_stanzas() {
+	awk -v url="$1" 'BEGIN { RS = "" }
+		{
+			hit = 0; out = ""
+			nl = split($0, lines, "\n")
+			for (i = 1; i <= nl; i++) {
+				l = lines[i]
+				key = tolower(l)
+				if (key ~ /^uris:/) {
+					nu = split(l, u, /[ \t]+/)
+					for (j = 2; j <= nu; j++) {
+						g = u[j]; sub(/\/$/, "", g)
+						if (g == url) hit = 1
+					}
+					l = "URIs: " url
+				} else if (key ~ /^types:/) {
+					l = "Types: deb-src"
+				} else if (key ~ /^enabled:/) {
+					continue
+				}
+				out = out l "\n"
+			}
+			if (hit) printf "%s\n", out
+		}' "$2"
+}
+
+# One-line-format entries that serve the given URL, rewritten as deb-src.
+src_lines() {
+	awk -v url="$1" '$1 == "deb" {
+			for (i = 2; i <= NF; i++) {
+				g = $i; sub(/\/$/, "", g)
+				if (g == url) { sub(/^deb/, "deb-src"); print; next }
+			}
+		}' "$2"
+}
+
+# Write source entries for the given repository URLs into a private
+# directory. Returns failure if nothing matched.
+write_src_sources() {
+	local outdir=$1 f n=0 url text
+	shift
+	mkdir -p "$outdir"
+	for url in "$@"; do
+		for f in /etc/apt/sources.list.d/*.sources; do
+			[[ -r $f ]] || continue
+			text=$(src_stanzas "$url" "$f")
+			[[ -n $text ]] || continue
+			n=$((n + 1))
+			printf '%s\n' "$text" >"$outdir/$n.sources"
+		done
+		for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+			[[ -r $f ]] || continue
+			text=$(src_lines "$url" "$f")
+			[[ -n $text ]] || continue
+			n=$((n + 1))
+			printf '%s\n' "$text" >"$outdir/$n.list"
+		done
+	done
+	[[ $n -gt 0 ]]
+}
+
+# Download and unpack a libinput source package into $work/src, using a
+# private apt configuration in $work/apt. Nothing on the system is modified
+# and no root is needed. $1 is the work directory, $2 the version to fetch
+# (empty for the newest the private sources offer).
+apt_fetch_source() {
+	local work=$1 want=${2:+=$2}
+	local -a opts
+	mkdir -p "$work/apt/lists/partial" "$work/apt/archives/partial" "$work/src"
+	opts=(
+		-o "Dir::Etc::sourcelist=/dev/null"
+		-o "Dir::Etc::sourceparts=$work/apt/sources.list.d"
+		-o "Dir::State::lists=$work/apt/lists"
+		-o "Dir::Cache::archives=$work/apt/archives"
+		-o "Dir::Cache::srcpkgcache=$work/apt/srcpkgcache.bin"
+		-o "Dir::Cache::pkgcache=$work/apt/pkgcache.bin"
+		-o "Debug::NoLocking=1"
+	)
+	# As root, apt would drop to the _apt user, which cannot write here.
+	[[ $EUID -eq 0 ]] && opts+=(-o "APT::Sandbox::User=root")
+	apt-get "${opts[@]}" -qq update ||
+		die "could not read the source index; the repository may not publish sources"
+	(cd "$work/src" && apt-get "${opts[@]}" -qq source "libinput$want") ||
+		die "could not download the libinput source package"
+}
+
+# Source of the system's own libinput, from the repositories it came from.
+fetch_stock_source() {
+	local base=$1 work=$2
+	local -a urls
+	mapfile -t urls < <(repo_urls_for "$base")
+	[[ ${#urls[@]} -gt 0 ]] || die "no repository offers $PKG $base"
+	write_src_sources "$work/apt/sources.list.d" "${urls[@]}" ||
+		die "could not derive a source repository from: ${urls[*]}"
+	step "Fetching libinput $base source from ${urls[*]}"
+	apt_fetch_source "$work" "$base"
+}
+
+# Source of a newer libinput, from a newer release of the base distribution.
+# The release's signature is checked against the keyring already installed.
+fetch_backport_source() {
+	local work=$1
+	backport_source || die "no backport source is known for this distribution"
+	[[ -r $BP_KEYRING ]] ||
+		die "missing $BP_KEYRING. Install the $(basename "$BP_KEYRING" .gpg) package (ubuntu-keyring or debian-archive-keyring)."
+	mkdir -p "$work/apt/sources.list.d"
+	printf 'Types: deb-src\nURIs: %s\nSuites: %s\nComponents: main\nSigned-By: %s\n' \
+		"$BP_URI" "$BP_SUITES" "$BP_KEYRING" >"$work/apt/sources.list.d/backport.sources"
+	step "Fetching libinput source from $BP_LABEL ($BP_SUITES)"
+	apt_fetch_source "$work" ""
+}
+
+# Options shared by build and install. Defaults come from the previous
+# install, so that restoring after an upgrade needs no flags.
+OPT_BACKPORT=''
+OPT_FINGERS=''
+FINGERS_SOURCE=flag
+parse_build_opts() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--backport) OPT_BACKPORT=yes ;;
+		--fingers)
+			shift
+			OPT_FINGERS=${1:-}
+			;;
+		--fingers=*) OPT_FINGERS=${1#*=} ;;
+		*) die "unknown option: $1" ;;
+		esac
+		shift
+	done
+	[[ -n $OPT_BACKPORT ]] || OPT_BACKPORT=$(state_get backport)
+	if [[ -z $OPT_FINGERS ]]; then
+		FINGERS_SOURCE=remembered
+		OPT_FINGERS=$(state_get fingers)
+		[[ -n $OPT_FINGERS ]] || OPT_FINGERS=$(is_patched && builtin_fingers || true)
+	fi
+	if [[ -z $OPT_FINGERS ]]; then
+		FINGERS_SOURCE=default
+		OPT_FINGERS=$DEFAULT_FINGERS
+	fi
+	[[ $OPT_FINGERS == 3 || $OPT_FINGERS == 4 ]] || die "--fingers takes 3 or 4"
+}
+
+# Sets OUT_DIR, NEW_VERSION, STOCK_VERSION, BUILD_MODE and SERIES.
+do_build() {
+	require_debian
+	local installed up srcver prefix series n=1 work srcdir dist p log missing other
+
+	installed=$(installed_version)
+	[[ -n $installed ]] || die "$PKG is not installed"
+	STOCK_VERSION=$(repo_version)
+	[[ -n $STOCK_VERSION ]] || die "no repository offers $PKG; run 'sudo apt-get update' first"
+
+	if version_ge "$(upstream_of "$STOCK_VERSION")" "$MIN_LIBINPUT"; then
+		BUILD_MODE=stock
+	elif [[ $OPT_BACKPORT == yes ]]; then
+		BUILD_MODE=backport
+	else
+		info "libinput $(upstream_of "$STOCK_VERSION") is too old; multi-finger drag arrived in $MIN_LIBINPUT."
+		if backport_source; then
+			info "A newer libinput can be built from $BP_LABEL sources. To go ahead:"
+			info "  fingerdrag install --backport"
+			info "That sets up three-finger drag. Add --fingers 4 for four fingers."
+		fi
+		die "nothing to build for this libinput"
+	fi
+
+	work="$CACHE_DIR/work"
+	rm -rf "${CACHE_DIR:?}/work"
+	mkdir -p "$work"
+	if [[ $BUILD_MODE == stock ]]; then
+		fetch_stock_source "$STOCK_VERSION" "$work"
+	else
+		fetch_backport_source "$work"
+	fi
+
+	srcdir=$(find "$work/src" -mindepth 1 -maxdepth 1 -type d -name 'libinput-*' | head -1)
+	[[ -n $srcdir ]] || die "source package did not unpack as expected"
+	cd "$srcdir"
+
+	srcver=$(dpkg-parsechangelog -S Version)
+	up=$(upstream_of "$srcver")
+	version_ge "$up" "$MIN_LIBINPUT" ||
+		die "the source is libinput $up, which is still older than $MIN_LIBINPUT"
+	series=$(pick_series "$up")
+	[[ -n $series ]] || die "no patch series for libinput $up"
+	SERIES=$series
+
+	# A backport sorts below the real package of the newer release, so a
+	# later distribution upgrade replaces it cleanly.
+	prefix=$srcver
+	[[ $BUILD_MODE == backport ]] && prefix="${srcver}~bpo"
+	if [[ $installed =~ ^(.*)\+${SUFFIX}([0-9]+)$ && ${BASH_REMATCH[1]} == "$prefix" ]]; then
+		n=$((BASH_REMATCH[2] + 1))
+	fi
+	NEW_VERSION="${prefix}+${SUFFIX}${n}"
+	OUT_DIR="$CACHE_DIR/$NEW_VERSION"
+
+	info "${B}Building libinput $NEW_VERSION${N}"
+	row "Replaces" "$installed"
+	row "Source" "$srcver ($BUILD_MODE)"
+	row "Patch series" "$series ($(find "$PATCH_DIR/$series" -name '*.patch' | wc -l) patches)"
+	other=$((7 - OPT_FINGERS))
+	case "$FINGERS_SOURCE" in
+	default) row "Drag with" "${B}$(fingers_word "$OPT_FINGERS")${N} (the default; pass --fingers $other for $(fingers_word "$other"))" ;;
+	remembered) row "Drag with" "${B}$(fingers_word "$OPT_FINGERS")${N} (as before; pass --fingers $other for $(fingers_word "$other"))" ;;
+	*) row "Drag with" "${B}$(fingers_word "$OPT_FINGERS")${N}" ;;
+	esac
+
+	step "Applying patches"
+	for p in "$PATCH_DIR/$series"/*.patch; do
+		info "  $(basename "$p")"
+		patch -p1 -s --no-backup-if-mismatch <"$p" ||
+			die "$(basename "$p") does not apply to libinput $srcver. Please report this."
+	done
+	sed -i "s/^$BUILTIN_DEFINE .*/$BUILTIN_DEFINE $OPT_FINGERS/" src/evdev-mt-touchpad-gestures.c
+	[[ $(grep -c "^$BUILTIN_DEFINE $OPT_FINGERS\$" src/evdev-mt-touchpad-gestures.c) -eq 1 ]] ||
+		die "could not set the default finger count in the patched source"
+
+	dist=$(os_field VERSION_CODENAME)
+	[[ -n $dist ]] || dist=$(dpkg-parsechangelog -S Distribution)
+	{
+		printf 'libinput (%s) %s; urgency=medium\n\n' "$NEW_VERSION" "$dist"
+		printf '  * Local rebuild by fingerdrag %s: %s-finger drag enabled by\n' "$VERSION" "$OPT_FINGERS"
+		printf '    default. Override at runtime with %s=0|3|4.\n\n' "$MARK"
+		printf ' -- %s <%s>  %s\n\n' \
+			"${DEBFULLNAME:-fingerdrag local build}" \
+			"${DEBEMAIL:-fingerdrag@localhost}" "$(date -R)"
+		cat debian/changelog
+	} >debian/changelog.new
+	mv debian/changelog.new debian/changelog
+
+	if ! missing=$(dpkg-checkbuilddeps 2>&1); then
+		missing=$(sed -E 's/.*[Uu]nmet build dependencies: //; s/\([^)]*\)//g; s/\|[^ ]+//g' <<<"$missing" | tr -s ' ')
+		info ""
+		info "Build dependencies are missing. Install them with:"
+		info "  sudo apt-get install --no-install-recommends $missing"
+		die "then run this command again"
+	fi
+
+	log="$work/build.log"
+	step "Compiling"
+	if ! DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" dpkg-buildpackage -b -us -uc >"$log" 2>&1; then
+		tail -n 25 "$log" >&2
+		die "build failed; full log in $log"
+	fi
+
+	rm -rf "${CACHE_DIR:?}/${NEW_VERSION:?}"
+	mkdir -p "$OUT_DIR"
+	mv "$work"/src/*.deb "$log" "$OUT_DIR"/
+	cd "$OUT_DIR"
+
+	step "Verifying the result"
+	dpkg-deb --fsys-tarfile "$OUT_DIR"/"${PKG}"_*.deb |
+		tar -xO --wildcards '*/libinput.so.*.*' 2>/dev/null |
+		grep -a -c "$BUILTIN_MARK=$OPT_FINGERS" >/dev/null ||
+		die "the built library does not contain the patch; refusing to continue"
+	rm -rf "${CACHE_DIR:?}/work"
+	info "${G}Built in $OUT_DIR:${N}"
+	find "$OUT_DIR" -maxdepth 1 -name '*.deb' -printf '  %f\n' | sort
+}
+
+cmd_build() {
+	parse_build_opts "$@"
+	do_build
+	info ""
+	info "Install with: fingerdrag install"
+}
+
+# --- install / uninstall ----------------------------------------------------
+
+# Built packages whose binary package is currently installed.
+debs_to_install() {
+	local deb
+	for deb in "$1"/*.deb; do
+		pkg_installed "$(dpkg-deb -f "$deb" Package)" && echo "$deb"
+	done
+	return 0
+}
+
+# Closing message of an install. The finger count is the first thing people
+# get wrong, so it must be impossible to miss.
+finger_banner() {
+	local n=$1 other=$((7 - $1)) word
+	word=$(fingers_word "$n")
+	info ""
+	info "${B}  ======================================================${N}"
+	info "${B}    DRAG WITH ${word^^}${N}"
+	info "${B}  ======================================================${N}"
+	info "  Log out and back in. Then rest $word on the touchpad"
+	info "  and move them to drag."
+	info ""
+	info "  For $(fingers_word "$other") instead:  fingerdrag install --fingers $other"
+	# The tap is only given up where the finger-down patch applies.
+	if compgen -G "$PATCH_DIR/$SERIES/0002-*.patch" >/dev/null; then
+		if [[ $n == 3 ]]; then
+			info "  Three-finger tap (middle click) now belongs to the drag."
+			info "  Four-finger drag keeps it."
+		else
+			info "  Three-finger tap (middle click) still works."
+		fi
+	fi
+}
+
+cmd_install() {
+	local rollback deb name
+	local -a debs sandbox=()
+	[[ $EUID -eq 0 ]] && sandbox=(-o "APT::Sandbox::User=root")
+	parse_build_opts "$@"
+	do_build
+	mapfile -t debs < <(debs_to_install "$OUT_DIR")
+	[[ ${#debs[@]} -gt 0 ]] || die "nothing to install"
+
+	step "Saving stock packages for rollback"
+	rollback="$OUT_DIR/rollback"
+	mkdir -p "$rollback"
+	for deb in "${debs[@]}"; do
+		name=$(dpkg-deb -f "$deb" Package)
+		(cd "$rollback" && apt-get -qq "${sandbox[@]}" download "$name=$STOCK_VERSION") ||
+			warn "could not download stock $name $STOCK_VERSION"
+	done
+
+	step "Installing (needs root)"
+	as_root dpkg -i "${debs[@]}"
+	as_root mkdir -p "$PREFIX/bin" "$PREFIX/share/fingerdrag" "$STATE_DIR/rollback"
+	# Skip the self-copy when already running the installed copy.
+	if [[ ! $SELF -ef $PREFIX/bin/fingerdrag ]]; then
+		as_root install -m 0755 "$SELF" "$PREFIX/bin/fingerdrag"
+	fi
+	if [[ ! $PATCH_DIR -ef $PREFIX/share/fingerdrag/patches ]]; then
+		as_root rm -rf "${PREFIX:?}/share/fingerdrag/patches"
+		as_root cp -r "$PATCH_DIR" "$PREFIX/share/fingerdrag/patches"
+	fi
+	if compgen -G "$rollback/*.deb" >/dev/null; then
+		as_root find "$STATE_DIR/rollback" -maxdepth 1 -name '*.deb' -delete
+		as_root cp "$rollback"/*.deb "$STATE_DIR/rollback/"
+	fi
+	printf 'DPkg::Post-Invoke { "[ ! -x %s/bin/fingerdrag ] || %s/bin/fingerdrag check || true"; };\n' \
+		"$PREFIX" "$PREFIX" | as_root tee "$HOOK_FILE" >/dev/null
+	printf 'stock=%s\nbackport=%s\nfingers=%s\n' \
+		"$STOCK_VERSION" "$([[ $BUILD_MODE == backport ]] && echo yes || echo no)" "$OPT_FINGERS" |
+		as_root tee "$STATE_FILE" >/dev/null
+
+	info ""
+	info "${G}Installed libinput $NEW_VERSION.${N}"
+	finger_banner "$OPT_FINGERS"
+}
+
+cmd_uninstall() {
+	require_debian
+	local stock name
+	local -a pkgs=()
+	stock=$(repo_version)
+
+	# Drop the hook first so that restoring stock packages does not warn.
+	as_root rm -f "$HOOK_FILE" "$STATE_FILE"
+
+	if is_patched; then
+		for name in libinput10 libinput-bin libinput-tools libinput-dev; do
+			pkg_installed "$name" && pkgs+=("$name=$stock")
+		done
+		step "Restoring stock libinput $stock (needs root)"
+		if [[ -z $stock ]] || ! as_root apt-get install --reinstall --allow-downgrades -y "${pkgs[@]}"; then
+			warn "could not get stock packages from the repository; using the saved ones"
+			compgen -G "$STATE_DIR/rollback/*.deb" >/dev/null ||
+				die "no saved packages in $STATE_DIR/rollback"
+			as_root dpkg -i "$STATE_DIR"/rollback/*.deb
+		fi
+	else
+		info "Stock libinput is already installed."
+	fi
+
+	if [[ -d $STATE_DIR/rollback ]]; then
+		as_root find "$STATE_DIR/rollback" -maxdepth 1 -name '*.deb' -delete
+		as_root rmdir "$STATE_DIR/rollback" "$STATE_DIR" 2>/dev/null || true
+	fi
+	as_root rm -rf "${PREFIX:?}/share/fingerdrag"
+	as_root rm -f "${PREFIX:?}/bin/fingerdrag"
+	rm -f "$ENV_FILE"
+	info "${G}Removed.${N} Log out and back in to finish."
+}
+
+# --- set / check ------------------------------------------------------------
+
+cmd_set() {
+	local val
+	case "${1:-}" in
+	3 | 4) val=$1 ;;
+	off | 0) val=0 ;;
+	*) die "usage: fingerdrag set 3|4|off" ;;
+	esac
+	if [[ $(session_type) == x11 ]]; then
+		info "On X11 the X server is started by the display manager and does not read"
+		info "per-user settings, so this command cannot work here. Instead:"
+		if [[ $val == 0 ]]; then
+			info "  fingerdrag uninstall"
+		else
+			info "  fingerdrag install --fingers $val"
+		fi
+		return 1
+	fi
+	mkdir -p "$(dirname "$ENV_FILE")"
+	printf '# Written by fingerdrag. Read by the patched libinput at session start.\n%s=%s\n' \
+		"$MARK" "$val" >"$ENV_FILE"
+	info "Wrote $ENV_FILE"
+	[[ $val == 3 ]] && info "Note: three-finger drag takes over the three-finger tap (middle click)."
+	is_patched || warn "the patched libinput is not installed, so this has no effect yet"
+	info "Log out and back in to apply."
+}
+
+# Called from the apt hook after every dpkg run. Must stay quiet when all is
+# well and must never fail.
+cmd_check() {
+	[[ -e $STATE_FILE ]] || return 0
+	is_patched && return 0
+	printf '\n%sfingerdrag:%s a package upgrade replaced the patched libinput with stock %s.\n' \
+		"$Y" "$N" "$(installed_version)" >&2
+	printf 'Multi-finger drag is off until you run: fingerdrag install\n\n' >&2
+}
+
+usage() {
+	cat <<USAGE
+fingerdrag $VERSION - three- and four-finger drag for Linux touchpads
+
+Usage: fingerdrag <command> [options]
+
+  doctor      Show what this system supports and what to do next
+  build       Build the patched libinput packages without installing them
+  install     Build, install, and watch for upgrades that undo the patch
+  set 3|4|off Choose the drag finger count for this user (Wayland sessions)
+  uninstall   Restore the stock libinput packages and remove fingerdrag
+  check       Report if an upgrade replaced the patched build (apt hook)
+
+Options for build and install:
+
+  --fingers 3|4  Finger count to drag with (default: 3). Three-finger drag
+                 takes over the three-finger tap; four-finger drag does not.
+  --backport     Allow building a newer libinput from a newer release of
+                 your distribution when the system one is older than $MIN_LIBINPUT
+
+Both options are remembered, so a plain 'fingerdrag install' restores the
+same build after a system upgrade has replaced it.
+USAGE
+}
+
+main() {
+	local cmd=${1:-}
+	shift || true
+	case "$cmd" in
+	doctor) cmd_doctor "$@" ;;
+	build) cmd_build "$@" ;;
+	install) cmd_install "$@" ;;
+	uninstall) cmd_uninstall "$@" ;;
+	set) cmd_set "$@" ;;
+	check) cmd_check "$@" ;;
+	-V | --version | version) echo "fingerdrag $VERSION" ;;
+	-h | --help | help | '') usage ;;
+	*)
+		usage >&2
+		exit 2
+		;;
+	esac
+}
+
+main "$@"

@@ -1,0 +1,29 @@
+name: CI
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly, to notice when a distribution update breaks the patch series.
+    - cron: "17 5 * * 1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck fingerdrag tests/*.sh
+
+  end-to-end:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - "debian:trixie"
+          - "ubuntu:26.04"
+          - "ubuntu:24.04"
+          - "debian:bookworm"
+          - "linuxmintd/mint22-amd64"
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/run.sh "${{ matrix.image }}"

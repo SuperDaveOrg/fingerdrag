@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dave Koons <koons.dave@gmail.com>
+Date: Sat, 3 Oct 2026 18:27:17 -0400
+Subject: [PATCH] touchpad: enable multi-finger drag by default, with an env
+ override
+
+Not every compositor exposes libinput's 3fg-drag config option, and the
+X11 driver never does, so the only way to get the gesture there is to
+change libinput's default.
+
+Default to three-finger drag, the gesture people know by that name. The
+built-in finger count is a single define that the fingerdrag build tool
+rewrites, and it is embedded as a string so the installed default can be
+read back from the binary. LIBINPUT_DRAG_3FG_DEFAULT overrides it at
+runtime: 0 disables, 3 or 4 selects the finger count. Devices with too few
+slots, or with gestures disabled, keep the stock default of disabled.
+
+Not for upstream: this is a stopgap until the setting is exposed.
+---
+ src/evdev-mt-touchpad-gestures.c | 35 +++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/evdev-mt-touchpad-gestures.c b/src/evdev-mt-touchpad-gestures.c
+index 50956207..4b6b7c9f 100644
+--- a/src/evdev-mt-touchpad-gestures.c
++++ b/src/evdev-mt-touchpad-gestures.c
+@@ -25,6 +25,8 @@
+ 
+ #include <math.h>
+ #include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "evdev-mt-touchpad.h"
+ 
+@@ -2324,10 +2326,41 @@ tp_3fg_drag_get_enabled(struct libinput_device *device)
+ 	return LIBINPUT_CONFIG_3FG_DRAG_DISABLED;
+ }
+ 
++/* Local change: finger count used when LIBINPUT_DRAG_3FG_DEFAULT is unset.
++ * fingerdrag rewrites this line at build time; keep it on one line. */
++#define FINGERDRAG_DEFAULT_NFINGERS 3
++#define FINGERDRAG_STR_(x) #x
++#define FINGERDRAG_STR(x) FINGERDRAG_STR_(x)
++
++/* Lets tools read the built-in default out of the binary. */
++__attribute__((used)) static const char fingerdrag_builtin_nfingers[] =
++	"FINGERDRAG_BUILTIN_NFINGERS=" FINGERDRAG_STR(FINGERDRAG_DEFAULT_NFINGERS);
++
+ static enum libinput_config_3fg_drag_state
+ tp_3fg_drag_default(struct tp_dispatch *tp)
+ {
+-	return LIBINPUT_CONFIG_3FG_DRAG_DISABLED;
++	/* Local change: not every compositor exposes the 3fg-drag config
++	 * option, and the X driver never does, so enable it here by default.
++	 * Override at runtime with LIBINPUT_DRAG_3FG_DEFAULT=0 (off), 3 or 4
++	 * (finger count). */
++	const char *env = getenv("LIBINPUT_DRAG_3FG_DEFAULT");
++	int nfingers = FINGERDRAG_DEFAULT_NFINGERS;
++
++	if (env) {
++		if (strcmp(env, "0") == 0)
++			return LIBINPUT_CONFIG_3FG_DRAG_DISABLED;
++		else if (strcmp(env, "3") == 0)
++			nfingers = 3;
++		else if (strcmp(env, "4") == 0)
++			nfingers = 4;
++	}
++
++	if (!tp_gesture_are_gestures_enabled(tp) ||
++	    (int)tp->num_slots < nfingers)
++		return LIBINPUT_CONFIG_3FG_DRAG_DISABLED;
++
++	return nfingers == 3 ? LIBINPUT_CONFIG_3FG_DRAG_ENABLED_3FG
++			     : LIBINPUT_CONFIG_3FG_DRAG_ENABLED_4FG;
+ }
+ 
+ static enum libinput_config_3fg_drag_state

@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dave Koons <koons.dave@gmail.com>
+Date: Sat, 3 Oct 2026 16:47:08 -0400
+Subject: [PATCH] touchpad: start the drag on finger-down even with
+ tap-to-click enabled
+
+Upstream only takes the responsive finger-down entry path into
+3FG_DRAG_OR_SWIPE_START when tapping is disabled. With tapping enabled
+the drag can only begin through the motion path, where the fingers are
+already moving and the fast-swipe test usually classifies the gesture as
+a swipe.
+
+Treat the configured drag finger count as claimed by the drag:
+tp_tap_notify() no longer sends a button for it, so there is no tap left
+to disambiguate against and the finger-down path is safe.
+
+Cost: with three-finger drag enabled, the three-finger tap (middle click
+by default) is no longer available. One- and two-finger taps are
+unaffected, and four-finger drag costs nothing since taps above three
+fingers were never reported.
+---
+ src/evdev-mt-touchpad-gestures.c | 8 ++++++--
+ src/evdev-mt-touchpad-tap.c      | 5 +++++
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/evdev-mt-touchpad-gestures.c b/src/evdev-mt-touchpad-gestures.c
+index 4b6b7c9f..6ff90ba1 100644
+--- a/src/evdev-mt-touchpad-gestures.c
++++ b/src/evdev-mt-touchpad-gestures.c
+@@ -555,8 +555,12 @@ tp_gesture_handle_event_on_state_none(struct tp_dispatch *tp,
+ 		 * 3fg pinch/hold. Those are niche enough to not worry about
+ 		 * for now.
+ 		 */
+-		if (!tp->tap.enabled &&
+-		    tp->drag_3fg.nfingers == tp->gesture.finger_count) {
++		/* Local change: enabling the drag for a given finger count
++		 * claims that finger count for dragging - tp_tap_notify()
++		 * declines to send a button for it - so there is no tap left
++		 * to disambiguate against and the responsive entry path is
++		 * safe even with tap-to-click enabled. */
++		if (tp->drag_3fg.nfingers == tp->gesture.finger_count) {
+ 			tp->gesture.state = GESTURE_STATE_3FG_DRAG_OR_SWIPE_START;
+ 		} else {
+ 			tp_gesture_set_hold_timer(tp, time);
+diff --git a/src/evdev-mt-touchpad-tap.c b/src/evdev-mt-touchpad-tap.c
+index 596ba944..13e6131d 100644
+--- a/src/evdev-mt-touchpad-tap.c
++++ b/src/evdev-mt-touchpad-tap.c
+@@ -135,6 +135,11 @@ tp_tap_notify(struct tp_dispatch *tp,
+ 	if (nfingers < 1 || nfingers > 3)
+ 		return;
+ 
++	/* Local change: this finger count is configured for dragging, the
++	 * button it would otherwise send is not available as a tap. */
++	if (tp->drag_3fg.nfingers == (size_t)nfingers)
++		return;
++
+ 	tp_gesture_cancel(tp, time);
+ 
+ 	button = button_map[tp->tap.map][nfingers - 1];
