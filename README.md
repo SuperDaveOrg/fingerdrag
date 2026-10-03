@@ -27,7 +27,7 @@ compositor has to turn it on. Run the doctor to see where your system stands:
 
 Debian, Ubuntu, Linux Mint and other systems based on them:
 
-    git clone https://github.com/SuperDaveLab/fingerdrag
+    git clone https://github.com/SuperDaveOrg/fingerdrag
     cd fingerdrag
     ./fingerdrag install
 

@@ -10,8 +10,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: shellcheck fingerdrag tests/*.sh
+      - uses: actions/checkout@v5
+      - run: tests/lint.sh
 
   end-to-end:
     runs-on: ubuntu-latest
@@ -25,5 +25,5 @@ jobs:
           - "debian:bookworm"
           - "linuxmintd/mint22-amd64"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: tests/run.sh "${{ matrix.image }}"

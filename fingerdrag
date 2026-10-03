@@ -559,7 +559,9 @@ parse_build_opts() {
 	if [[ -z $OPT_FINGERS ]]; then
 		FINGERS_SOURCE=remembered
 		OPT_FINGERS=$(state_get fingers)
-		[[ -n $OPT_FINGERS ]] || OPT_FINGERS=$(is_patched && builtin_fingers || true)
+		if [[ -z $OPT_FINGERS ]] && is_patched; then
+			OPT_FINGERS=$(builtin_fingers)
+		fi
 	fi
 	if [[ -z $OPT_FINGERS ]]; then
 		FINGERS_SOURCE=default
